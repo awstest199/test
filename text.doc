@@ -1,0 +1,40 @@
+
+ StoneBranch triggers the daily run (schedule, retry-on-failure, alerting) by kicking off the EMR cluster/step-sequence; EMR Steps handle the sequencing within that one run. That's a very standard split and matches everything we already know about this pipeline.
+
+EMR cluster/job run
+  Step 1: fileparser  (on-prem copy → curated_app_fact → S3)
+  Step 2: aggregator   (AVV/DVS, velocity rollup, segment-share → base matrix in Redshift)
+  Step 3: dq_postagg   (reads base matrix, runs the 13 checks, writes verdict)
+
+
+  Each step is its own JVM/Spark session — no shared state between them except what's persisted to S3/Redshift in between
+
+  EMR's per-step ActionOnFailure setting: if dq_postagg exits non-zero, EMR can be configured to halt the cluster (TERMINATE_CLUSTER) or cancel remaining steps (CANCEL_AND_WAIT)
+
+
+python/src/
+    fileparser/          <- Stage 1, exists
+        __init__.py
+        config_parser.py
+        curated_app_fact.py
+        driver.py
+    aggregator/           <- Stage 2, not yet built (placeholder name)
+        __init__.py
+        driver.py
+        ...
+    dq_postagg/           <- Stage 3, this is what we're designing
+        __init__.py
+        config_parser.py
+        redshift_reader.py
+        checks/
+            __init__.py
+            registry.py           <- @register_rule_check(rule_id=N) decorator + lookup
+            completeness.py
+            correctness.py
+            reliability.py
+            coverage_lineage.py
+            rule1_checks.py
+            rule2_checks.py
+            rule3_checks.py
+        results_writer.py
+        driver.py
