@@ -1,1 +1,42 @@
-test
+python/src/
+    driver.py                    <- THE ONE orchestrator: runs preaggregator -> aggregator -> postaggregator in sequence
+
+    data_access/                 <- NEW shared package, used by all three EMR-stage packages
+        __init__.py
+        reader.py                  <- read_curated_table(name, filters) -> DataFrame  (hides Iceberg/Glue/whatever-it-ends-up-being)
+        writer.py                  <- write_curated_table(df, name, mode)  (same abstraction, for writes)
+        config.py                  <- catalog/connection details, the one place that changes if the underlying DB decision changes
+
+    fileparser/                  <- unchanged, external process, not part of this EMR-workflow orchestration at all
+        __init__.py
+        config_parser.py
+        curated_app_fact.py
+        driver.py                  <- stays as-is; it's invoked independently by StoneBranch before the EMR workflow starts, not by the new top-level driver.py
+
+    preaggregator/                <- EMR Stage 1 (lightweight validation)
+        __init__.py
+        run.py                     <- standalone entry point, for running just this stage in isolation
+        checks/
+            ...
+
+    aggregator/                   <- EMR Stage 2 (not yet built)
+        __init__.py
+        run.py
+        ...
+
+    postaggregator/               <- EMR Stage 3 (what we've been calling dq_postagg)
+        __init__.py
+        run.py                     <- standalone entry point, for running just this stage in isolation
+        checks/
+            registry.py
+            completeness.py
+            correctness.py
+            reliability.py
+            coverage_lineage.py
+            timeliness.py
+            security_compliance.py
+            structural_integrity.py
+            rule1_checks.py
+            rule2_checks.py
+            rule3_checks.py
+        results_writer.py
