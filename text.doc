@@ -1,77 +1,21 @@
 """
-Completeness checks -- finalized DQ table rows 5, 6, 7, 8.
+Correctness checks -- finalized DQ table row 9.
 """
 
 from .registry import CheckResult
 
-# placeholder -- confirm real mandatory column names against the finalized base matrix schema
-MANDATORY_FIELDS = ["portfolio_id", "run_id"]
 
-# catalog Rules 1, 3, 5 -- user's conversational numbering 1, 2, 3
-ACTIVE_RULE_IDS = ["1", "2", "3"]
-
-
-def check_output_completeness(df, active_rules=None, active_portfolios=None):
-    """Row 5: for every portfolio in scope and every rule applicable to
-    it, a result should exist for the expected run window."""
-    active_rules = active_rules or ACTIVE_RULE_IDS
-    if not active_portfolios:
-        return CheckResult(
-            check_name="output_completeness",
-            passed=True,
-            severity="block",
-            details="active_portfolios not supplied -- skipped, not verified",
-        )
-    present = {
-        (row["portfolio_id"], row["rule_id"])
-        for row in df.select("portfolio_id", "rule_id").distinct().collect()
-    }
-    expected = {(p, r) for p in active_portfolios for r in active_rules}
-    missing = expected - present
+def check_nan_infinity(df):
+    """Row 9: divide-by-zero protection, not covered by the no-null
+    check -- a NaN/Infinity value isn't null, it's a value that exists
+    but the aggregation math broke (e.g. Rule 1's z-score dividing by a
+    zero-variance baseline_stddev, or Rule 3's share dividing by a
+    zero-account cohort)."""
+    bad_rows = df.filter("isnan(output_metric) OR abs(output_metric) = double('inf')")
+    bad_count = bad_rows.count()
     return CheckResult(
-        check_name="output_completeness",
-        passed=(len(missing) == 0),
-        severity="block",
-        details=f"{len(missing)} missing (portfolio, rule) combination(s): {sorted(missing)[:10]}",
-    )
-
-
-def check_mandatory_fields_completeness(df):
-    """Row 6: critical fields must be populated for all records."""
-    bad_count = 0
-    for field in MANDATORY_FIELDS:
-        if field in df.columns:
-            bad_count += df.filter(df[field].isNull()).count()
-    return CheckResult(
-        check_name="mandatory_fields_completeness",
+        check_name="nan_infinity",
         passed=(bad_count == 0),
         severity="block",
-        details=f"{bad_count} null(s) across mandatory fields {MANDATORY_FIELDS}",
-    )
-
-
-def check_rules_count_sanity(df, active_rules=None):
-    """Row 7: number of distinct rules producing output this cycle
-    should match the number currently expected to run through
-    aggregation (currently 3)."""
-    active_rules = active_rules or ACTIVE_RULE_IDS
-    distinct_rules = {row["rule_id"] for row in df.select("rule_id").distinct().collect()}
-    expected = set(active_rules)
-    return CheckResult(
-        check_name="rules_count_sanity",
-        passed=(distinct_rules == expected),
-        severity="block",
-        details=f"found rule_ids {sorted(distinct_rules)}, expected {sorted(expected)}",
-    )
-
-
-def check_no_null_computed_metrics(df):
-    """Row 8: aggregated metrics that should be produced actually have
-    values."""
-    bad_count = df.filter(df["output_metric"].isNull()).count()
-    return CheckResult(
-        check_name="no_null_computed_metrics",
-        passed=(bad_count == 0),
-        severity="block",
-        details=f"{bad_count} row(s) with null output_metric",
+        details=f"{bad_count} row(s) with NaN/Infinity output_metric",
     )
