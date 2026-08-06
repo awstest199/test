@@ -1,62 +1,9 @@
 """
-Standalone entry point for EMR Stage 1 (curatedqrules) -- lightweight
-validation of the curated data landing in S3, run before the aggregation
-job (Stage 2) starts. Deliberately basic, "not complete DQ checks" --
-that's metricdqrules' job (Stage 3, post-aggregation).
+Catalog/connection config for data_access.
 
-No checks/ subfolder here -- confirmed not needed for this stage; the
-few basic checks live directly in this file rather than a modular
-registry.
-
-Usage (standalone): spark-submit run_curatedqrules.py
-Usage (from the top-level driver.py): import and call main()
+Placeholder -- the actual Glue Catalog database name, table naming
+convention, and any connection details are not finalized yet. Confirm
+against the real environment before this goes anywhere near production.
 """
 
-import sys
-
-from data_access.curated_data_reader import read_curated_table
-
-CURATED_TABLE_NAME = "curated.curated_app_fact"  # placeholder -- confirm real table name
-EXPECTED_COLUMNS = ["client_id", "entered_dttm"]  # placeholder -- confirm against real curated_app_fact schema
-
-
-def check_data_present(df):
-    """Today's curated batch must be non-empty before aggregation spends
-    compute on it."""
-    row_count = df.count()
-    return row_count > 0, f"{row_count} row(s) found"
-
-
-def check_basic_schema(df, expected_columns):
-    """Basic structural sanity -- the columns aggregation actually needs
-    must be present. Not the full schema-drift check (metricdqrules
-    handles that, row 3 of the finalized DQ table) -- just enough to
-    fail fast if something's badly wrong."""
-    missing = [c for c in expected_columns if c not in df.columns]
-    detail = f"missing columns: {missing}" if missing else "all expected columns present"
-    return len(missing) == 0, detail
-
-
-def main(spark=None):
-    from pyspark.sql import SparkSession
-    spark = spark or SparkSession.builder.appName("curatedqrules").getOrCreate()
-
-    df = read_curated_table(spark, CURATED_TABLE_NAME)
-
-    checks_passed = True
-
-    present, detail = check_data_present(df)
-    print(f"[{'PASS' if present else 'BLOCK'}] data_present: {detail}")
-    checks_passed = checks_passed and present
-
-    schema_ok, detail = check_basic_schema(df, EXPECTED_COLUMNS)
-    print(f"[{'PASS' if schema_ok else 'BLOCK'}] basic_schema: {detail}")
-    checks_passed = checks_passed and schema_ok
-
-    if not checks_passed:
-        sys.exit(1)
-    sys.exit(0)
-
-
-if __name__ == "__main__":
-    main()
+GLUE_CATALOG_DATABASE = "fraud_detection"  # placeholder
