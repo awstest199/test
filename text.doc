@@ -1,92 +1,40 @@
 """
-Standalone entry point for EMR Stage 3 (metricdqrules) -- reads the
-curated/aggregated data, runs every generic check plus each active
-rule's rule-specific checks, rolls the results up into one verdict, and
-exits 0 (pass/warn) or non-zero (block) so EMR's ActionOnFailure setting
-can react to it. Exit code is set explicitly here -- it is NOT automatic
-just because the script ran to completion without an exception.
+Registry for rule-specific Stage 3 (post-aggregation) DQ checks.
 
-Usage (standalone): spark-submit run_metricdqrules.py
-Usage (from the top-level driver.py): import and call main()
+Generic checks (completeness.py, correctness.py, reliability.py,
+coverage_lineage.py, structural_integrity.py) do NOT use this registry --
+they are plain functions imported directly into run_metricdqrules.py's
+GENERIC_CHECKS list and always run, regardless of which rules are active
+this cycle.
+
+This registry exists only for checks that vary per rule. Confirmed scope
+(2026-08-06): only Rule 2 (velocity, user's conversational numbering) has
+a rule-specific checks module (velocityRule_checks.py) -- Rule 1 (volume
+spike) and Rule 3 (segment share) do not get their own modules right now.
 """
 
-import sys
-import uuid
+from dataclasses import dataclass
+from typing import Callable
 
-from data_access.curated_data_reader import read_curated_table
-
-from checks import completeness, correctness, reliability, coverage_lineage, structural_integrity
-from checks.registry import get_checks_for_rule
-from results_writer import write_results
-
-BASE_MATRIX_TABLE_NAME = "metrics.base_matrix"  # placeholder -- not finalized
-ACTIVE_RULE_IDS = ["1", "2", "3"]  # catalog Rules 1, 3, 5 -- user's conversational numbering
-
-# The 13-rule finalized DQ table, minus rows 1/2 (Timeliness) and row 4
-# (Security/Compliance) -- confirmed 2026-08-06 as deliberately not
-# implemented, not an oversight.
-GENERIC_CHECKS = [
-    completeness.check_output_completeness,          # row 5
-    completeness.check_mandatory_fields_completeness,  # row 6
-    completeness.check_rules_count_sanity,             # row 7
-    completeness.check_no_null_computed_metrics,       # row 8
-    correctness.check_nan_infinity,                    # row 9
-    reliability.check_idempotent_rerun,                # row 11
-    coverage_lineage.check_audit_traceability,         # row 12
-    structural_integrity.check_schema_drift,           # row 3
-    # reliability.check_deterministic_output (row 10) is NOT in this list --
-    # it needs a rerun_df the generic loop below can't supply. Call it
-    # separately once a rerun comparison is actually wired up.
-]
+_REGISTRY: dict[str, list[Callable]] = {}
 
 
-def run_checks(df, active_rules=None, active_portfolios=None):
-    active_rules = active_rules or ACTIVE_RULE_IDS
-    results = []
-    for check_fn in GENERIC_CHECKS:
-        if check_fn is completeness.check_output_completeness:
-            results.append(check_fn(df, active_rules=active_rules, active_portfolios=active_portfolios))
-        elif check_fn is completeness.check_rules_count_sanity:
-            results.append(check_fn(df, active_rules=active_rules))
-        else:
-            results.append(check_fn(df))
-
-    for rule_id in active_rules:
-        for check_fn in get_checks_for_rule(rule_id):
-            results.append(check_fn(df))
-
-    return results
+def register_rule_check(rule_id: str):
+    """Decorator: register a check function under a specific rule_id."""
+    def decorator(fn: Callable) -> Callable:
+        _REGISTRY.setdefault(rule_id, []).append(fn)
+        return fn
+    return decorator
 
 
-def decide_verdict(results):
-    if any((not r.passed) and r.severity == "block" for r in results):
-        return "block"
-    if any(not r.passed for r in results):
-        return "warn"
-    return "pass"
+def get_checks_for_rule(rule_id: str) -> list[Callable]:
+    """Every check registered for rule_id, or [] if it has none."""
+    return _REGISTRY.get(rule_id, [])
 
 
-def main(spark=None, active_portfolios=None):
-    from pyspark.sql import SparkSession
-    spark = spark or SparkSession.builder.appName("metricdqrules").getOrCreate()
-
-    run_id = str(uuid.uuid4())
-    df = read_curated_table(spark, BASE_MATRIX_TABLE_NAME)
-
-    results = run_checks(df, active_portfolios=active_portfolios)
-    verdict = decide_verdict(results)
-
-    write_results(spark, results, run_id)
-
-    for r in results:
-        status = "PASS" if r.passed else r.severity.upper()
-        print(f"[{status}] {r.check_name}: {r.details}")
-    print(f"metricdqrules verdict: {verdict} (run_id={run_id})")
-
-    if verdict == "block":
-        sys.exit(1)
-    sys.exit(0)
-
-
-if __name__ == "__main__":
-    main()
+@dataclass
+class CheckResult:
+    check_name: str
+    passed: bool
+    severity: str  # "block" or "warn"
+    details: str = ""
