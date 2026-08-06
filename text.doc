@@ -1,18 +1,15 @@
 """
-Shared read layer for curated/aggregated data, used by curatedqrules,
-aggregator, and metricdqrules alike.
+Shared write layer for curated/aggregated data.
 
-Currently a thin wrapper around Spark's Glue-Catalog/Iceberg table
-access. The exact catalog/table naming convention isn't finalized yet --
-this is a starter implementation so the rest of the pipeline can be
-written and tested against a stable interface regardless.
+Starter implementation -- confirm the actual Iceberg write mode and
+partitioning strategy before this goes anywhere near production.
 """
 
 
-def read_curated_table(spark, table_name, filters=None):
-    """table_name should be the full Glue-catalog-qualified name, e.g.
-    'catalog.database.table'."""
-    df = spark.table(table_name)
-    if filters:
-        df = df.filter(filters)
-    return df
+def write_curated_table(df, table_name, mode="append"):
+    if mode == "append":
+        df.writeTo(table_name).append()
+    elif mode == "overwrite_partitions":
+        df.writeTo(table_name).overwritePartitions()
+    else:
+        raise ValueError(f"Unsupported write mode: {mode!r}")
