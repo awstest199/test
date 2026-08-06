@@ -1,9 +1,18 @@
 """
-Catalog/connection config for data_access.
+Shared read layer for curated/aggregated data, used by curatedqrules,
+aggregator, and metricdqrules alike.
 
-Placeholder -- the actual Glue Catalog database name, table naming
-convention, and any connection details are not finalized yet. Confirm
-against the real environment before this goes anywhere near production.
+Currently a thin wrapper around Spark's Glue-Catalog/Iceberg table
+access. The exact catalog/table naming convention isn't finalized yet --
+this is a starter implementation so the rest of the pipeline can be
+written and tested against a stable interface regardless.
 """
 
-GLUE_CATALOG_DATABASE = "fraud_detection"  # placeholder
+
+def read_curated_table(spark, table_name, filters=None):
+    """table_name should be the full Glue-catalog-qualified name, e.g.
+    'catalog.database.table'."""
+    df = spark.table(table_name)
+    if filters:
+        df = df.filter(filters)
+    return df
