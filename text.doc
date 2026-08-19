@@ -1,0 +1,35 @@
+# Semantic context for the Bedrock Structured Knowledge Base POC
+# Table name must be fully qualified as: database.schema.table
+
+knowledge_base:
+  id: "BVVYNIWK3W"
+  region: "us-east-1"
+
+generation_context:
+  tables:
+    - name: "awsdatacatalog.fraud_poc.503032406_fraud_detection"
+      description: "Transaction-level fraud data used to identify fraudulent or suspicious purchases."
+      columns:
+        - name: "transaction_id"
+          description: "Unique identifier for each transaction."
+        - name: "customer_id"
+          description: "Unique identifier for the customer who made the transaction."
+        - name: "amount"
+          description: "Transaction amount in US dollars."
+        - name: "merchant"
+          description: "Merchant where the transaction occurred."
+        - name: "fraud_flag"
+          description: "Boolean fraud indicator. TRUE means fraudulent or suspicious; FALSE means legitimate."
+
+  curated_queries:
+    - natural_language: "Which transactions are suspicious?"
+      sql: |
+        SELECT transaction_id, customer_id, amount, merchant, fraud_flag
+        FROM awsdatacatalog.fraud_poc."503032406_fraud_detection"
+        WHERE fraud_flag = true;
+
+    - natural_language: "What is the total amount of fraudulent transactions?"
+      sql: |
+        SELECT SUM(amount) AS total_fraud_amount
+        FROM awsdatacatalog.fraud_poc."503032406_fraud_detection"
+        WHERE fraud_flag = true;
