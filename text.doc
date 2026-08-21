@@ -1,0 +1,112 @@
+Bedrock Structured Knowledge Base with S3 Tables
+Redshift Serverless query engine + AWS Default Glue Data Catalog + Lake Formation
+Purpose. This document captures the working setup used to connect an Amazon S3 Tables table to an Amazon Bedrock structured Knowledge Base, using Amazon Redshift Serverless as the SQL query engine. The key requirement is to expose the S3 Tables database through a resource link in the default Glue Data Catalog and grant Lake Formation permissions to the Bedrock KB service role.
+1. Working architecture
+S3 Tables
+  fraud-poc-table-bucket
+    └─ frauddetectionathena
+        └─ sample_table1
+              ↓
+S3 Tables federated catalog
+              ↓
+Lake Formation resource link: finaltest
+(in default Glue catalog 724772076249)
+              ↓
+Bedrock Structured Knowledge Base
+              ↓
+Redshift Serverless query engine
+Important: The table does not need to become a native Redshift table. Redshift Serverless is used as the query engine; the schema/table is supplied through the AWS Default Glue Data Catalog.
+2. Create the resource link in the default Glue catalog
+In the AWS console, go to Lake Formation → Databases → Create resource link. Use the following values:
+Field	Value
+Resource link name	finaltest
+Destination catalog	724772076249 (default catalog)
+Shared database region	US East (N. Virginia)
+Shared database	frauddetectionathena
+Shared database catalog ID	724772076249:s3tablescatalog/fraud-poc-table-bucket
+Validation: return to Lake Formation → Databases, choose catalog 724772076249, and verify that finaltest appears there. This is the resource link Bedrock will use through the default Glue catalog.
+3. Lake Formation permissions
+Principal for both grants: sandbox-bedrock-kb
+3.1 Grant on the actual S3 Tables table
+Go to Lake Formation → Data permissions → Grant → Named Data Catalog resources and select:
+Catalog: 724772076249:s3tablescatalog/fraud-poc-table-bucket
+Database: frauddetectionathena
+Table: sample_table1
+Permissions: SELECT, DESCRIBE
+For this read-only KB use case, INSERT, DELETE, ALTER, DROP, SUPER, and grantable permissions are not required.
+3.2 Grant on the resource link
+Create a separate Lake Formation grant for the same role:
+Catalog: 724772076249 (default catalog)
+Database / resource link: finaltest
+Resource link permission: DESCRIBE
+Final Lake Formation permission model
+sandbox-bedrock-kb
+├─ Default Glue catalog: 724772076249
+│   └─ finaltest
+│      └─ DESCRIBE
+└─ S3 Tables catalog
+    └─ frauddetectionathena
+       └─ sample_table1
+          ├─ SELECT
+          └─ DESCRIBE
+4. IAM permission for the KB service role
+The Bedrock Knowledge Base service role should be able to request Lake Formation data access. Ensure the role has permission equivalent to:
+{
+  "Effect": "Allow",
+  "Action": "lakeformation:GetDataAccess",
+  "Resource": "*"
+}
+5. Redshift Serverless setup
+Use the same Redshift Serverless workgroup selected in the Bedrock KB configuration. For IAM authentication, create or verify an IAM database user for the KB service role and grant access to the external Glue catalog database.
+CREATE USER "IAMR:sandbox-bedrock-kb" WITH PASSWORD DISABLE;
+
+GRANT USAGE ON DATABASE awsdatacatalog
+TO "IAMR:sandbox-bedrock-kb";
+If the IAMR user already exists, do not recreate it.
+6. Create the Bedrock structured Knowledge Base
+Create a Knowledge Base with a Structured data store and configure it as follows:
+Setting	Value
+Query engine	Amazon Redshift
+Connection option	Redshift Serverless
+Workgroup	data-sbx-demo-mt1-wg
+Authentication	IAM Role
+KB service role	sandbox-bedrock-kb
+Data schema / storage	AWS Default Glue Data Catalog
+Glue catalog table	finaltest.sample_table1
+Do not enter frauddetectionathena.sample_table1 in the Bedrock Default Glue Catalog field. The KB should reference the resource link path: finaltest.sample_table1
+7. Sync and test
+Create the KB and run Sync. A successful setup shows “Sync completed” for the data source. Then open Test and start with simple questions such as:
+•	Show all transactions.
+•	Which transactions are fraudulent?
+•	What is the total amount of fraudulent transactions?
+A successful Bedrock-generated SQL statement for this setup can look like:
+SELECT *
+FROM awsdatacatalog.finaltest.sample_table1;
+8. Troubleshooting the main permission error
+If the KB test returns an error similar to “Insufficient Lake Formation permission(s) on sample_table1,” verify these items in order:
+1.	sandbox-bedrock-kb has SELECT and DESCRIBE on frauddetectionathena.sample_table1 in the S3 Tables catalog.
+2.	sandbox-bedrock-kb has DESCRIBE on the finaltest resource link in the default Glue catalog.
+3.	sandbox-bedrock-kb has lakeformation:GetDataAccess in IAM.
+4.	The Redshift IAM database user IAMR:sandbox-bedrock-kb exists and has USAGE on awsdatacatalog.
+5.	The Bedrock storage table is configured as finaltest.sample_table1.
+9. Add semantic context after the base KB works
+Once the plain structured KB can query the S3 Table successfully, add the semantic/generation context. Update the table reference in the YAML to the resource-link path, for example:
+generation_context:
+  tables:
+    - name: "finaltest.sample_table1"
+      description: >
+        Transaction-level fraud data.
+Then apply the semantic context to the KB using the same update script/API process used for the earlier structured-KB POC.
+10. Deployment checklist
+•	☐ S3 Table exists: frauddetectionathena.sample_table1.
+•	☐ Resource link exists in default Glue catalog: finaltest.
+•	☐ KB role has DESCRIBE on finaltest.
+•	☐ KB role has SELECT + DESCRIBE on the actual S3 Table.
+•	☐ KB role has lakeformation:GetDataAccess.
+•	☐ Redshift IAMR user exists for sandbox-bedrock-kb.
+•	☐ IAMR user has USAGE on awsdatacatalog.
+•	☐ Bedrock KB uses Redshift Serverless as query engine.
+•	☐ Bedrock storage uses AWS Default Glue Data Catalog.
+•	☐ Bedrock table reference is finaltest.sample_table1.
+•	☐ KB sync completes successfully.
+•	☐ Plain KB test succeeds before semantic YAML is applied.
