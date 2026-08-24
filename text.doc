@@ -1,45 +1,31 @@
-"""Runs the skill's evaluator (looked up by skill_type in
-evaluators.base.EVALUATORS) against however many worker outputs were
-collected -- always exactly one reduce step per skill, regardless of how
-many workers fed into it. An unrecognized skill_type or any evaluator
-exception becomes a graceful ERROR result rather than crashing the skill
-subgraph.
+"""Compiles the per-skill subgraph used as the top-level graph's
+skill_subgraph node (see src/graph/build_graph.py). Fan-out #2
+(dispatch_agents -> N x agent_worker) is sized by
+len(skill['required_agents']) at runtime -- nothing here assumes a fixed
+worker count. Wiring:
+
+    START -> dispatch_agents (conditional: Send x M) -> agent_worker (x M, parallel)
+          -> reduce_agent -> END
 """
 
-from src.graph.evaluators.base import EVALUATORS, build_error_result
+from langgraph.graph import END, START, StateGraph
+
+from src.graph.skill_subgraph.nodes.agent_worker import agent_worker
+from src.graph.skill_subgraph.nodes.dispatch_agents import dispatch_agents
+from src.graph.skill_subgraph.nodes.reduce_agent import reduce_agent
 from src.graph.state import SkillState
-from src.logging_setup import get_logger
-
-logger = get_logger()
 
 
-async def reduce_agent(state: SkillState) -> dict:
-    skill = state["skill"]
-    worker_outputs = state["worker_outputs"]
-    log = logger.bind(request_id=state["request_id"], skill_id=skill["skill_id"])
+def build_skill_subgraph():
+    graph = StateGraph(SkillState)
+    graph.add_node("agent_worker", agent_worker)
+    graph.add_node("reduce_agent", reduce_agent)
 
-    log.info(
-        "reduce_agent_start",
-        worker_count=len(worker_outputs),
-        expected_count=len(skill["required_agents"]),
-    )
+    graph.add_conditional_edges(START, dispatch_agents, ["agent_worker"])
+    graph.add_edge("agent_worker", "reduce_agent")
+    graph.add_edge("reduce_agent", END)
 
-    evaluator = EVALUATORS.get(skill["skill_type"])
-    if evaluator is None:
-        log.error("unknown_skill_type", skill_type=skill["skill_type"])
-        result = build_error_result(skill, worker_outputs, f"unrecognized skill_type: {skill['skill_type']}")
-    else:
-        try:
-            result = evaluator(skill, worker_outputs)
-        except Exception as exc:  # noqa: BLE001 -- one bad evaluator must not crash the run
-            log.error("evaluator_exception", error=str(exc))
-            result = build_error_result(skill, worker_outputs, f"evaluator raised: {exc}")
+    return graph.compile()
 
-    result["client_id"] = state["client_id"]
 
-    if result["status"] == "FLAGGED" and result["severity"] in ("HIGH", "CRITICAL"):
-        log.warning("skill_flagged", metric_value=result["metric_value"], severity=result["severity"])
-    else:
-        log.info("skill_evaluated", status=result["status"], metric_value=result["metric_value"])
-
-    return {"result": result}
+skill_subgraph_app = build_skill_subgraph()
