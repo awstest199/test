@@ -1,75 +1,51 @@
-"""CLI runner for local dev -- no AWS credentials needed with the default
-KB_MOCK=true/LLM_MOCK=true and no SKILLS_MANIFEST_BUCKET set (falls back to
-the bundled src/fixtures/skills.md). Mirrors fraude/main.py's zero-setup UX.
+"""structlog configuration -- JSON to stdout.
 
-Usage:
-    python -m src.local_run --prompt "Run fraud detection for client AMAZON_PL"
-    python -m src.local_run --prompt "Check client AMAZON_PL for velocity fraud only"
+No explicit watchtower/CloudWatch handler by default: both Lambda and
+Bedrock AgentCore Runtime ship container stdout/stderr to CloudWatch
+natively, so an extra PutLogEvents handler would double-ship logs and
+need its own IAM grant. watchtower is only wired in when
+ENABLE_WATCHTOWER=true, for the one legitimate edge case of running
+src/local_run.py from a bare dev machine with no other CloudWatch path.
 """
 
-import argparse
-import asyncio
-import json
-import uuid
-from typing import Optional
+import logging
+import sys
 
-from src.config.settings import get_settings
-from src.graph.build_graph import build_graph
-from src.logging_setup import configure_logging
+import structlog
 
+from src.config.settings import AppSettings
 
-async def _run(prompt: str, manifest_bucket: Optional[str], manifest_key: Optional[str]) -> dict:
-    settings = get_settings()
-    configure_logging(settings)
-
-    graph = build_graph()
-    request_id = str(uuid.uuid4())
-
-    initial_state = {
-        "request_id": request_id,
-        "prompt": prompt,
-        "client_id": None,
-        "rule_filter": None,
-        "manifest_bucket": manifest_bucket or settings.skills_manifest_bucket,
-        "manifest_key": manifest_key or settings.skills_manifest_key,
-        "skills": [],
-        "results": [],
-        "errors": [],
-        "report_html": None,
-        "report_s3_uri": None,
-        "status": "PENDING",
-    }
-    return await graph.ainvoke(initial_state)
+_configured = False
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the Rule Agent graph locally")
-    parser.add_argument(
-        "--prompt",
-        required=True,
-        help="Natural-language request, e.g. 'Run fraud detection for client AMAZON_PL'",
+def configure_logging(settings: AppSettings) -> None:
+    global _configured
+    if _configured:
+        return
+
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(
+            getattr(logging, settings.log_level.upper(), logging.INFO)
+        ),
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
+        cache_logger_on_first_use=True,
     )
-    parser.add_argument("--manifest-bucket", default=None)
-    parser.add_argument("--manifest-key", default=None)
-    args = parser.parse_args()
 
-    final_state = asyncio.run(_run(args.prompt, args.manifest_bucket, args.manifest_key))
+    if settings.enable_watchtower:
+        import watchtower
 
-    print(
-        json.dumps(
-            {
-                "status": final_state.get("status"),
-                "client_id": final_state.get("client_id"),
-                "rule_filter": final_state.get("rule_filter"),
-                "report_s3_uri": final_state.get("report_s3_uri"),
-                "results": final_state.get("results"),
-                "errors": final_state.get("errors"),
-            },
-            indent=2,
-            default=str,
+        logging.getLogger().addHandler(
+            watchtower.CloudWatchLogHandler(log_group=settings.cloudwatch_log_group)
         )
-    )
+
+    _configured = True
 
 
-if __name__ == "__main__":
-    main()
+def get_logger(**initial_context):
+    return structlog.get_logger(**initial_context)
