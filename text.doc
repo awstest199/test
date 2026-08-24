@@ -1,63 +1,57 @@
-"""Environment/config for the Rule Agent LangGraph app.
+"""Top-level graph:
 
-Deliberately simple for MVP1 (no pydantic-settings) -- mirrors the
-per-service mock-flag pattern from capstone_project/fraude/config.py:
-each external dependency gets its own MOCK flag (KB_MOCK, LLM_MOCK)
-rather than one global switch, so you can flip one to "real" while the
-other stays mocked during incremental rollout.
+    START -> orchestrator -> (conditional: Send x N over skills | "report")
+          -> skill_subgraph (x N, parallel, each a compiled sub-graph invocation)
+          -> report -> END
+
+N is however many skills survive the orchestrator's manifest filter --
+nothing here assumes a fixed skill count.
 """
 
-from dataclasses import dataclass, field
-import os
+from langgraph.graph import END, START, StateGraph
 
-from dotenv import load_dotenv
+from src.graph.nodes.orchestrator import orchestrator, route_to_skills
+from src.graph.nodes.report import report_node
+from src.graph.skill_subgraph.build_skill_subgraph import skill_subgraph_app
+from src.graph.state import GraphState
+from src.logging_setup import get_logger
 
-load_dotenv()
+logger = get_logger()
 
 
-def _flag(name: str, default: str = "true") -> bool:
-    return os.environ.get(name, default).lower() != "false"
-
-
-@dataclass(frozen=True)
-class AppSettings:
-    app_env: str = field(default_factory=lambda: os.environ.get("APP_ENV", "local"))
-    aws_region: str = field(default_factory=lambda: os.environ.get("AWS_REGION", "us-east-1"))
-
-    # Knowledge Base -- single KB, all agent_worker instances hit the same one
-    knowledge_base_id: str = field(default_factory=lambda: os.environ.get("KNOWLEDGE_BASE_ID", ""))
-    kb_mock: bool = field(default_factory=lambda: _flag("KB_MOCK"))
-
-    # LLM (prompt decomposition + optional summary)
-    llm_mock: bool = field(default_factory=lambda: _flag("LLM_MOCK"))
-    bedrock_model_id: str = field(
-        default_factory=lambda: os.environ.get(
-            "BEDROCK_MODEL_ID", "anthropic.claude-3-5-haiku-20241022-v1:0"
-        )
+async def skill_subgraph_node(state: dict) -> dict:
+    """Wraps the compiled per-skill subgraph as a single top-level node.
+    One instance runs per Send() from route_to_skills; `state` here is the
+    partial payload that Send carries (request_id/client_id/skill), not the
+    full top-level GraphState.
+    """
+    skill = state["skill"]
+    sub_initial_state = {
+        "request_id": state["request_id"],
+        "client_id": state["client_id"],
+        "skill": skill,
+        "worker_outputs": {},
+        "result": None,
+    }
+    logger.info(
+        "skill_subgraph_dispatch",
+        request_id=state["request_id"],
+        skill_id=skill["skill_id"],
+        required_agent_count=len(skill["required_agents"]),
     )
-
-    # Skills manifest (S3)
-    skills_manifest_bucket: str = field(default_factory=lambda: os.environ.get("SKILLS_MANIFEST_BUCKET", ""))
-    skills_manifest_key: str = field(
-        default_factory=lambda: os.environ.get("SKILLS_MANIFEST_KEY", "skills/skills.md")
-    )
-
-    # Report output (S3) -- a distinct bucket from the manifest input bucket
-    report_output_bucket: str = field(default_factory=lambda: os.environ.get("REPORT_OUTPUT_BUCKET", ""))
-    report_output_prefix: str = field(
-        default_factory=lambda: os.environ.get("REPORT_OUTPUT_PREFIX", "reports/")
-    )
-
-    # Optional executive-summary LLM call in the report node
-    enable_llm_summary: bool = field(default_factory=lambda: _flag("ENABLE_LLM_SUMMARY", "false"))
-
-    # Logging
-    log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO"))
-    enable_watchtower: bool = field(default_factory=lambda: _flag("ENABLE_WATCHTOWER", "false"))
-    cloudwatch_log_group: str = field(
-        default_factory=lambda: os.environ.get("CLOUDWATCH_LOG_GROUP", "/rule-agent/langgraph")
-    )
+    final_state = await skill_subgraph_app.ainvoke(sub_initial_state)
+    return {"results": [final_state["result"]]}
 
 
-def get_settings() -> AppSettings:
-    return AppSettings()
+def build_graph():
+    graph = StateGraph(GraphState)
+    graph.add_node("orchestrator", orchestrator)
+    graph.add_node("skill_subgraph", skill_subgraph_node)
+    graph.add_node("report", report_node)
+
+    graph.add_edge(START, "orchestrator")
+    graph.add_conditional_edges("orchestrator", route_to_skills, ["skill_subgraph", "report"])
+    graph.add_edge("skill_subgraph", "report")
+    graph.add_edge("report", END)
+
+    return graph.compile()
