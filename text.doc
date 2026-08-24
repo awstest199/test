@@ -1,48 +1,68 @@
-"""Two separate state schemas on purpose: the top-level graph's dynamic
-fan-out is over `skills` (fan-out #1), the per-skill subgraph's dynamic
-fan-out is over that one skill's `required_agents` (fan-out #2). Mixing
-both into one flat schema would blur which reducer applies to which
-fan-out level.
+"""Orchestrator: LLM-decomposes the incoming prompt into client_id +
+rule_filter (entity resolution from prose, not calculation-parameter
+parsing -- see services/llm_service.decompose_prompt for why), then
+deterministically loads and filters the skills manifest. Fan-out #1
+(route_to_skills) sends one branch per remaining skill -- nothing here
+assumes a fixed skill count.
 """
 
-import operator
-from typing import Annotated, Literal, Optional, TypedDict
+from datetime import datetime, timezone
 
-from src.models.manifest import SkillManifestEntry
-from src.models.results import SkillResult
+from langgraph.types import Send
 
+from src.config.settings import get_settings
+from src.graph.state import GraphState
+from src.logging_setup import get_logger
+from src.services import llm_service, manifest_service
 
-# --- top-level graph ---
-class GraphState(TypedDict):
-    request_id: str
-    prompt: str  # raw natural-language prompt from Lambda
-    client_id: Optional[str]  # populated by the LLM decomposition step
-    rule_filter: Optional[list[str]]  # rule_ids/skill_ids requested, or None = all
-    invoked_at: str
-    manifest_bucket: str
-    manifest_key: str
-    skills: list[SkillManifestEntry]
-    results: Annotated[list[SkillResult], operator.add]  # fan-in #1 reducer
-    errors: Annotated[list[str], operator.add]
-    report_html: Optional[str]
-    report_s3_uri: Optional[str]
-    status: Literal["PENDING", "DECOMPOSING", "RUNNING", "COMPLETED", "FAILED"]
+logger = get_logger()
 
 
-# --- per-skill subgraph ---
-class SkillState(TypedDict):
-    request_id: str
-    client_id: str
-    skill: SkillManifestEntry
-    worker_outputs: Annotated[dict, operator.or_]  # fan-in #2 reducer, {agent_role: parsed_answer}
-    result: Optional[SkillResult]
+async def orchestrator(state: GraphState) -> dict:
+    log = logger.bind(request_id=state["request_id"])
+    settings = get_settings()
+
+    log.info("decompose_prompt_start", prompt=state["prompt"][:300])
+    intent = llm_service.decompose_prompt(state["prompt"], settings)
+    client_id = intent.get("client_id")
+    rule_filter = intent.get("rule_filter")
+    log.info("decompose_prompt_done", client_id=client_id, rule_filter=rule_filter)
+
+    if not client_id:
+        log.error("decompose_prompt_missing_client_id", prompt=state["prompt"][:300])
+        return {
+            "client_id": None,
+            "rule_filter": rule_filter,
+            "skills": [],
+            "status": "FAILED",
+            "errors": ["Could not resolve a client_id from the prompt"],
+        }
+
+    manifest_bucket = state.get("manifest_bucket") or settings.skills_manifest_bucket
+    manifest_key = state.get("manifest_key") or settings.skills_manifest_key
+
+    all_skills = manifest_service.load_manifest(manifest_bucket, manifest_key, settings.aws_region)
+    skills = manifest_service.filter_skills(all_skills, client_id, rule_filter)
+    log.info("manifest_filtered", total_skills=len(all_skills), applicable_skills=len(skills))
+
+    return {
+        "client_id": client_id,
+        "rule_filter": rule_filter,
+        "manifest_bucket": manifest_bucket,
+        "manifest_key": manifest_key,
+        "skills": skills,
+        "status": "RUNNING",
+        "invoked_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
-# --- per-agent-worker branch state (the payload each Send carries) ---
-class AgentWorkerInput(TypedDict, total=False):
-    request_id: str
-    client_id: str
-    rule_id: str
-    agent_role: str
-    question_template: str
-    window_hours: Optional[int]  # from the skill's threshold, if the template references {window_hours}
+def route_to_skills(state: GraphState):
+    if state.get("status") == "FAILED" or not state.get("skills"):
+        return "report"
+    return [
+        Send(
+            "skill_subgraph",
+            {"request_id": state["request_id"], "client_id": state["client_id"], "skill": skill},
+        )
+        for skill in state["skills"]
+    ]
