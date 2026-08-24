@@ -1,57 +1,48 @@
-"""Top-level graph:
-
-    START -> orchestrator -> (conditional: Send x N over skills | "report")
-          -> skill_subgraph (x N, parallel, each a compiled sub-graph invocation)
-          -> report -> END
-
-N is however many skills survive the orchestrator's manifest filter --
-nothing here assumes a fixed skill count.
+"""Two separate state schemas on purpose: the top-level graph's dynamic
+fan-out is over `skills` (fan-out #1), the per-skill subgraph's dynamic
+fan-out is over that one skill's `required_agents` (fan-out #2). Mixing
+both into one flat schema would blur which reducer applies to which
+fan-out level.
 """
 
-from langgraph.graph import END, START, StateGraph
+import operator
+from typing import Annotated, Literal, Optional, TypedDict
 
-from src.graph.nodes.orchestrator import orchestrator, route_to_skills
-from src.graph.nodes.report import report_node
-from src.graph.skill_subgraph.build_skill_subgraph import skill_subgraph_app
-from src.graph.state import GraphState
-from src.logging_setup import get_logger
-
-logger = get_logger()
+from src.models.manifest import SkillManifestEntry
+from src.models.results import SkillResult
 
 
-async def skill_subgraph_node(state: dict) -> dict:
-    """Wraps the compiled per-skill subgraph as a single top-level node.
-    One instance runs per Send() from route_to_skills; `state` here is the
-    partial payload that Send carries (request_id/client_id/skill), not the
-    full top-level GraphState.
-    """
-    skill = state["skill"]
-    sub_initial_state = {
-        "request_id": state["request_id"],
-        "client_id": state["client_id"],
-        "skill": skill,
-        "worker_outputs": {},
-        "result": None,
-    }
-    logger.info(
-        "skill_subgraph_dispatch",
-        request_id=state["request_id"],
-        skill_id=skill["skill_id"],
-        required_agent_count=len(skill["required_agents"]),
-    )
-    final_state = await skill_subgraph_app.ainvoke(sub_initial_state)
-    return {"results": [final_state["result"]]}
+# --- top-level graph ---
+class GraphState(TypedDict):
+    request_id: str
+    prompt: str  # raw natural-language prompt from Lambda
+    client_id: Optional[str]  # populated by the LLM decomposition step
+    rule_filter: Optional[list[str]]  # rule_ids/skill_ids requested, or None = all
+    invoked_at: str
+    manifest_bucket: str
+    manifest_key: str
+    skills: list[SkillManifestEntry]
+    results: Annotated[list[SkillResult], operator.add]  # fan-in #1 reducer
+    errors: Annotated[list[str], operator.add]
+    report_html: Optional[str]
+    report_s3_uri: Optional[str]
+    status: Literal["PENDING", "DECOMPOSING", "RUNNING", "COMPLETED", "FAILED"]
 
 
-def build_graph():
-    graph = StateGraph(GraphState)
-    graph.add_node("orchestrator", orchestrator)
-    graph.add_node("skill_subgraph", skill_subgraph_node)
-    graph.add_node("report", report_node)
+# --- per-skill subgraph ---
+class SkillState(TypedDict):
+    request_id: str
+    client_id: str
+    skill: SkillManifestEntry
+    worker_outputs: Annotated[dict, operator.or_]  # fan-in #2 reducer, {agent_role: parsed_answer}
+    result: Optional[SkillResult]
 
-    graph.add_edge(START, "orchestrator")
-    graph.add_conditional_edges("orchestrator", route_to_skills, ["skill_subgraph", "report"])
-    graph.add_edge("skill_subgraph", "report")
-    graph.add_edge("report", END)
 
-    return graph.compile()
+# --- per-agent-worker branch state (the payload each Send carries) ---
+class AgentWorkerInput(TypedDict, total=False):
+    request_id: str
+    client_id: str
+    rule_id: str
+    agent_role: str
+    question_template: str
+    window_hours: Optional[int]  # from the skill's threshold, if the template references {window_hours}
