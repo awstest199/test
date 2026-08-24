@@ -1,40 +1,37 @@
+"""Plain TypedDict contracts for evaluation results and the MVP1 report context."""
+
+from typing import Literal, Optional, TypedDict
+
+from src.models.manifest import ThresholdSpec
 
 
-from typing import Literal, TypedDict
-
-
-class RequiredAgent(TypedDict):
-    agent_role: str  # e.g. "baseline_data_agent", "aggregation_agent"
-    question_template: str
-
-
-class ThresholdSpec(TypedDict, total=False):
-    max_trended_rate_bps: float  # lag_trend_projection: flag if Trended TNF rate exceeds this
-    stress_uplift: float  # defaults to 1.2 if omitted, see evaluators/lag_trend_projection.py
-    max_apps_per_entity: int
-    window_hours: int
-    psi_warning: float
-    psi_critical: float
-
-
-class SkillManifestEntry(TypedDict):
+class SkillResult(TypedDict):
     skill_id: str
     rule_id: str
+    client_id: str
     name: str
-    description: str  # markdown body under this skill's front matter
-    enabled: bool
-    skill_type: Literal["UCL", "VENDOR_CODE_MATCH", "PSI"]  # key into evaluators/base.py's EVALUATORS dict
-    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
-    applicable_portfolios: list[str]  # [] = all portfolios
-    threshold: ThresholdSpec
-    required_agents: list[RequiredAgent]  # dynamic length -- 2, 3, 4, 5, ...
+    severity: str
+    status: Literal["PASS", "FLAGGED", "ERROR", "SKIPPED"]
+    metric_value: Optional[float]
+    threshold_used: ThresholdSpec
+    worker_outputs_used: dict  # {agent_role: parsed_answer} snapshot, for audit
+    evaluated_at: str
+    error: Optional[str]
 
 
-REQUIRED_SKILL_KEYS = (
-    "skill_id",
-    "rule_id",
-    "name",
-    "skill_type",
-    "severity",
-    "required_agents",
-)
+class PromptIntent(TypedDict):
+    """Output of llm_service.decompose_prompt -- the only two fields the graph needs."""
+
+    client_id: Optional[str]
+    rule_filter: Optional[list[str]]
+
+
+class ReportContext(TypedDict):
+    request_id: str
+    client_id: str
+    invoked_at: str
+    prompt: str
+    results: list[SkillResult]
+    flagged_count: int
+    total_count: int
+    summary_text: Optional[str]  # only set when ENABLE_LLM_SUMMARY=true
