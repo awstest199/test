@@ -1,16 +1,18 @@
-.venv/Scripts/python.exe -c "
+python -c "
 import boto3
-from src.config.settings import get_settings
 
-settings = get_settings()
-client = boto3.client('bedrock-agent-runtime', region_name=settings.aws_region)
+KNOWLEDGE_BASE_ID = 'your-kb-id-here'
+AWS_REGION = 'us-east-1'
+MODEL_ID = 'anthropic.claude-3-5-haiku-20241022-v1:0'
+
+client = boto3.client('bedrock-agent-runtime', region_name=AWS_REGION)
 response = client.retrieve_and_generate(
     input={'text': 'Show me suspicious transactions'},
     retrieveAndGenerateConfiguration={
         'type': 'KNOWLEDGE_BASE',
         'knowledgeBaseConfiguration': {
-            'knowledgeBaseId': settings.knowledge_base_id,
-            'modelArn': settings.bedrock_model_id,
+            'knowledgeBaseId': KNOWLEDGE_BASE_ID,
+            'modelArn': MODEL_ID,
         },
     },
 )
