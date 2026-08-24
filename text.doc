@@ -1,39 +1,58 @@
-"""Placeholder reduce-step evaluator.
-
-The real per-rule comparison logic (base/baseline matrix, from
-baseline_data_agent, vs. the near-real-time matrix from aggregation_agent)
-is intentionally NOT implemented yet. This just proves the plumbing --
-dynamic worker fan-out/fan-in, dispatch by skill_type -- end to end, and
-returns a SKIPPED result carrying both matrices for inspection.
-
-When the real comparison logic is ready: add dedicated evaluator
-functions (one per skill_type, or shared where the math is genuinely the
-same) and wire them into EVALUATORS in base.py. Nothing else in the graph
-needs to change -- reduce_agent already dispatches purely by skill_type.
+"""Generic worker: one dynamic instance per required_agents entry. Formats
+its assigned question_template, calls the single Knowledge Base, and
+returns its parsed answer keyed by agent_role. A KB call/parse failure for
+one worker becomes an error marker for that role, not an exception that
+kills the whole skill.
 """
 
-from src.graph.evaluators import base
+from src.config.settings import get_settings
+from src.graph.state import AgentWorkerInput
 from src.logging_setup import get_logger
+from src.services import kb_query_service
 
 logger = get_logger()
 
 
-def evaluate(skill: dict, worker_outputs: dict) -> dict:
-    base_matrix = worker_outputs.get("baseline_data_agent")
-    realtime_matrix = worker_outputs.get("aggregation_agent")
+def _substitute_placeholders(template: str, **values) -> str:
+    """Replaces only exact `{key}` tokens via literal string substitution --
+    deliberately NOT str.format()/format_map(). Question templates embed
+    literal JSON examples (e.g. `{"mature_rate_bps": ...}`) to show the KB
+    what shape to answer in, and Python's format mini-language chokes on
+    the `:` inside those braces (raises "Format specifier missing
+    precision"). Plain substring replacement sidesteps that entirely and
+    leaves every other `{...}` in the text untouched. A value of None
+    leaves its placeholder as-is (rule types that don't need it, e.g.
+    {window_hours} on a non-velocity question, simply won't contain the
+    token to begin with)."""
+    result = template
+    for key, value in values.items():
+        if value is None:
+            continue
+        result = result.replace("{" + key + "}", str(value))
+    return result
 
-    logger.info(
-        "placeholder_evaluator_called",
-        skill_id=skill["skill_id"],
-        skill_type=skill["skill_type"],
-        has_base_matrix=base_matrix is not None,
-        has_realtime_matrix=realtime_matrix is not None,
+
+async def agent_worker(state: AgentWorkerInput) -> dict:
+    agent_role = state["agent_role"]
+    log = logger.bind(
+        request_id=state["request_id"],
+        rule_id=state["rule_id"],
+        agent_role=agent_role,
     )
 
-    return base.build_result(
-        skill,
-        status="SKIPPED",
-        metric_value=None,
-        worker_outputs=worker_outputs,
-        error="Comparison logic not yet implemented -- placeholder only.",
+    question = _substitute_placeholders(
+        state["question_template"],
+        client_id=state["client_id"],
+        rule_id=state["rule_id"],
+        window_hours=state.get("window_hours"),
     )
+
+    settings = get_settings()
+    try:
+        answer = kb_query_service.query(question, settings)
+        log.info("agent_worker_ok", question=question[:200])
+    except Exception as exc:  # noqa: BLE001 -- one bad worker must not crash the skill
+        log.warning("agent_worker_failed", question=question[:200], error=str(exc))
+        answer = {"_error": str(exc)}
+
+    return {"worker_outputs": {agent_role: answer}}
