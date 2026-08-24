@@ -1,46 +1,37 @@
-"""Bedrock AgentCore Runtime entrypoint -- the container contract a future
-deployment step needs to satisfy: instantiate BedrockAgentCoreApp(),
-decorate invoke(payload) with @app.entrypoint, call app.run() under
-__main__. The framework binds port 8080 itself; no hand-written HTTP
-server here.
+"""CLI runner for local dev -- no AWS credentials needed with the default
+KB_MOCK=true/LLM_MOCK=true and no SKILLS_MANIFEST_BUCKET set (falls back to
+the bundled src/fixtures/skills.md). Mirrors fraude/main.py's zero-setup UX.
 
-Stateless by design: each invocation runs one fully independent graph
-execution (see src/graph/build_graph.py) with no AgentCore Memory
-integration and no state retained between calls.
+Usage:
+    python -m src.local_run --prompt "Run fraud detection for client AMAZON_PL"
+    python -m src.local_run --prompt "Check client AMAZON_PL for velocity fraud only"
 """
 
+import argparse
+import asyncio
+import json
 import uuid
-
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from typing import Optional
 
 from src.config.settings import get_settings
 from src.graph.build_graph import build_graph
-from src.logging_setup import configure_logging, get_logger
-
-app = BedrockAgentCoreApp()
-_graph = build_graph()  # compiled once at cold start, reused across invocations
+from src.logging_setup import configure_logging
 
 
-@app.entrypoint
-async def invoke(payload: dict) -> dict:
+async def _run(prompt: str, manifest_bucket: Optional[str], manifest_key: Optional[str]) -> dict:
     settings = get_settings()
     configure_logging(settings)
 
-    request_id = payload.get("request_id") or str(uuid.uuid4())
-    logger = get_logger(request_id=request_id)
-
-    prompt = payload.get("prompt")
-    if not prompt:
-        logger.error("invoke_missing_prompt")
-        return {"request_id": request_id, "status": "FAILED", "error": "payload.prompt is required"}
+    graph = build_graph()
+    request_id = str(uuid.uuid4())
 
     initial_state = {
         "request_id": request_id,
         "prompt": prompt,
         "client_id": None,
         "rule_filter": None,
-        "manifest_bucket": payload.get("manifest_bucket") or settings.skills_manifest_bucket,
-        "manifest_key": payload.get("manifest_key") or settings.skills_manifest_key,
+        "manifest_bucket": manifest_bucket or settings.skills_manifest_bucket,
+        "manifest_key": manifest_key or settings.skills_manifest_key,
         "skills": [],
         "results": [],
         "errors": [],
@@ -48,20 +39,37 @@ async def invoke(payload: dict) -> dict:
         "report_s3_uri": None,
         "status": "PENDING",
     }
+    return await graph.ainvoke(initial_state)
 
-    final_state = await _graph.ainvoke(initial_state)
-    results = final_state.get("results", [])
 
-    return {
-        "request_id": request_id,
-        "status": final_state.get("status"),
-        "client_id": final_state.get("client_id"),
-        "report_s3_uri": final_state.get("report_s3_uri"),
-        "total_skills_evaluated": len(results),
-        "flagged_count": sum(1 for r in results if r["status"] == "FLAGGED"),
-        "errors": final_state.get("errors", []),
-    }
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the Rule Agent graph locally")
+    parser.add_argument(
+        "--prompt",
+        required=True,
+        help="Natural-language request, e.g. 'Run fraud detection for client AMAZON_PL'",
+    )
+    parser.add_argument("--manifest-bucket", default=None)
+    parser.add_argument("--manifest-key", default=None)
+    args = parser.parse_args()
+
+    final_state = asyncio.run(_run(args.prompt, args.manifest_bucket, args.manifest_key))
+
+    print(
+        json.dumps(
+            {
+                "status": final_state.get("status"),
+                "client_id": final_state.get("client_id"),
+                "rule_filter": final_state.get("rule_filter"),
+                "report_s3_uri": final_state.get("report_s3_uri"),
+                "results": final_state.get("results"),
+                "errors": final_state.get("errors"),
+            },
+            indent=2,
+            default=str,
+        )
+    )
 
 
 if __name__ == "__main__":
-    app.run()
+    main()
