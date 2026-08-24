@@ -1,37 +1,68 @@
-"""Plain TypedDict contracts for evaluation results and the MVP1 report context."""
+"""Single Knowledge Base query service.
 
-from typing import Literal, Optional, TypedDict
+Every agent_worker instance, regardless of which skill/rule it's serving,
+calls this same module against the same KNOWLEDGE_BASE_ID. The KB resolves
+NL2SQL and executes against Redshift internally -- this service never
+builds SQL or talks to Redshift directly, and never needs Secrets Manager
+credentials.
+"""
 
-from src.models.manifest import ThresholdSpec
+import json
+import re
 
+import boto3
 
-class SkillResult(TypedDict):
-    skill_id: str
-    rule_id: str
-    client_id: str
-    name: str
-    severity: str
-    status: Literal["PASS", "FLAGGED", "ERROR", "SKIPPED"]
-    metric_value: Optional[float]
-    threshold_used: ThresholdSpec
-    worker_outputs_used: dict  # {agent_role: parsed_answer} snapshot, for audit
-    evaluated_at: str
-    error: Optional[str]
+from src.config.settings import AppSettings
+from src.logging_setup import get_logger
 
-
-class PromptIntent(TypedDict):
-    """Output of llm_service.decompose_prompt -- the only two fields the graph needs."""
-
-    client_id: Optional[str]
-    rule_filter: Optional[list[str]]
+logger = get_logger()
 
 
-class ReportContext(TypedDict):
-    request_id: str
-    client_id: str
-    invoked_at: str
-    prompt: str
-    results: list[SkillResult]
-    flagged_count: int
-    total_count: int
-    summary_text: Optional[str]  # only set when ENABLE_LLM_SUMMARY=true
+def _client(settings: AppSettings):
+    return boto3.client("bedrock-agent-runtime", region_name=settings.aws_region)
+
+
+def _extract_json(text: str) -> dict:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            raise ValueError(f"KB answer was not parseable as JSON: {text!r}")
+        return json.loads(match.group(0))
+
+
+def query(question: str, settings: AppSettings) -> dict:
+    """Calls retrieve_and_generate against the single configured Knowledge
+    Base and parses the generated answer as JSON.
+
+    Raises on total parse failure -- callers (agent_worker) are responsible
+    for catching that and turning it into a per-worker error marker rather
+    than letting one bad answer crash the whole skill.
+    """
+    if settings.kb_mock:
+        return _mock_answer(question)
+
+    client = _client(settings)
+    response = client.retrieve_and_generate(
+        input={"text": question},
+        retrieveAndGenerateConfiguration={
+            "type": "KNOWLEDGE_BASE",
+            "knowledgeBaseConfiguration": {
+                "knowledgeBaseId": settings.knowledge_base_id,
+                "modelArn": settings.bedrock_model_id,
+            },
+        },
+    )
+    answer_text = response["output"]["text"]
+    return _extract_json(answer_text)
+
+
+def _mock_answer(question: str) -> dict:
+    """Canned mock fields for local dev (KB_MOCK=true) -- a superset covering
+    what every current evaluator expects, regardless of which
+    question_template was actually asked."""
+    logger.info("kb_mock_query", question=question[:160])
+    return {
+
+    }
