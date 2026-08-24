@@ -1,62 +1,39 @@
-"""Evaluator contract + a flat dispatch dict.
+"""Placeholder reduce-step evaluator.
 
-No decorator-based registry (unlike fraude/skills/registry.py) -- at
-MVP1's 3-skill-type scale a plain dict is simpler and does the same job.
-Revisit only if the number of skill_types grows large enough that this
-dict gets unwieldy.
+The real per-rule comparison logic (base/baseline matrix, from
+baseline_data_agent, vs. the near-real-time matrix from aggregation_agent)
+is intentionally NOT implemented yet. This just proves the plumbing --
+dynamic worker fan-out/fan-in, dispatch by skill_type -- end to end, and
+returns a SKIPPED result carrying both matrices for inspection.
+
+When the real comparison logic is ready: add dedicated evaluator
+functions (one per skill_type, or shared where the math is genuinely the
+same) and wire them into EVALUATORS in base.py. Nothing else in the graph
+needs to change -- reduce_agent already dispatches purely by skill_type.
 """
 
-from datetime import datetime, timezone
-from typing import Optional, Protocol
+from src.graph.evaluators import base
+from src.logging_setup import get_logger
+
+logger = get_logger()
 
 
-class Evaluator(Protocol):
-    def __call__(self, skill: dict, worker_outputs: dict) -> dict: ...
+def evaluate(skill: dict, worker_outputs: dict) -> dict:
+    base_matrix = worker_outputs.get("baseline_data_agent")
+    realtime_matrix = worker_outputs.get("aggregation_agent")
 
+    logger.info(
+        "placeholder_evaluator_called",
+        skill_id=skill["skill_id"],
+        skill_type=skill["skill_type"],
+        has_base_matrix=base_matrix is not None,
+        has_realtime_matrix=realtime_matrix is not None,
+    )
 
-def build_result(
-    skill: dict,
-    status: str,
-    metric_value,
-    worker_outputs: dict,
-    error: Optional[str] = None,
-) -> dict:
-    return {
-        "skill_id": skill["skill_id"],
-        "rule_id": skill["rule_id"],
-        "name": skill["name"],
-        "severity": skill["severity"],
-        "status": status,
-        "metric_value": metric_value,
-        "threshold_used": skill.get("threshold") or {},
-        "worker_outputs_used": worker_outputs,
-        "evaluated_at": datetime.now(timezone.utc).isoformat(),
-        "error": error,
-    }
-
-
-def build_error_result(skill: dict, worker_outputs: dict, message: str) -> dict:
-    return build_result(skill, status="ERROR", metric_value=None, worker_outputs=worker_outputs, error=message)
-
-
-def _build_evaluators() -> dict:
-    # Deferred import: placeholder imports `base` for build_result, so this
-    # has to run after that's defined above, not at module top -- avoids a
-    # circular import at load time.
-    #
-    # All three skill_types map to the same placeholder for now (real
-    # per-rule comparison logic -- base matrix vs. real-time matrix from the
-    # KB -- is intentionally not implemented yet, see placeholder.py).
-    # Swapping in real logic later means adding dedicated evaluator
-    # functions and pointing the relevant key(s) at them here; reduce_agent
-    # and everything upstream of it stays unchanged.
-    from src.graph.evaluators import placeholder
-
-    return {
-        "UCL": placeholder.evaluate,
-        "VENDOR_CODE_MATCH": placeholder.evaluate,
-        "PSI": placeholder.evaluate,
-    }
-
-
-EVALUATORS: dict[str, Evaluator] = _build_evaluators()
+    return base.build_result(
+        skill,
+        status="SKIPPED",
+        metric_value=None,
+        worker_outputs=worker_outputs,
+        error="Comparison logic not yet implemented -- placeholder only.",
+    )
