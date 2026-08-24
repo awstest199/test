@@ -1,117 +1,44 @@
-"""Loads and parses the S3 skills.md manifest.
-
-Format: Markdown with one YAML front-matter block per skill (delimited by
-`---` lines), Markdown body underneath each block for the human-readable
-description. No pydantic/schema library -- only the required-key checks in
-REQUIRED_SKILL_KEYS. `required_agents` length is not fixed; it's read
-straight from each skill's own manifest entry.
+"""Renders the MVP1 report (simple summary table, not the full multi-section
+analyst dashboard -- see the plan) and uploads it to the report output S3
+bucket, which is distinct from the skills-manifest input bucket.
 """
 
-import re
 from pathlib import Path
 
 import boto3
-import yaml
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from src.config.settings import AppSettings
 from src.logging_setup import get_logger
-from src.models.manifest import REQUIRED_SKILL_KEYS, SkillManifestEntry
+from src.models.results import ReportContext
 
 logger = get_logger()
 
-_BLOCK_SEP_RE = re.compile(r"^---\s*$", re.MULTILINE)
-_DEFAULT_MANIFEST_PATH = Path(__file__).resolve().parent.parent / "fixtures" / "skills.md"
+_TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
+
+_env = Environment(
+    loader=FileSystemLoader(str(_TEMPLATES_DIR)),
+    autoescape=select_autoescape(["html"]),
+)
 
 
-def load_manifest(bucket: str, key: str, region: str) -> list[SkillManifestEntry]:
-    if not bucket:
-        # No SKILLS_MANIFEST_BUCKET configured -- fall back to the bundled
-        # default manifest so local dev (src/local_run.py) works with zero
-        # AWS setup. Production always sets the bucket explicitly.
-        logger.warning("skills_manifest_bucket_unset_using_local_fixture", path=str(_DEFAULT_MANIFEST_PATH))
-        raw_text = _DEFAULT_MANIFEST_PATH.read_text(encoding="utf-8")
-        return parse_manifest(raw_text)
-
-    client = boto3.client("s3", region_name=region)
-    response = client.get_object(Bucket=bucket, Key=key)
-    raw_text = response["Body"].read().decode("utf-8")
-    return parse_manifest(raw_text)
+def render(context: ReportContext) -> str:
+    template = _env.get_template("report.html.j2")
+    return template.render(**context)
 
 
-def parse_manifest(raw_text: str) -> list[SkillManifestEntry]:
-    """Splits on `---` block separators. Layout is
-    [preamble, frontmatter_1, body_1, frontmatter_2, body_2, ...] --
-    front-matter blocks land at odd indices, bodies at the following even
-    index."""
-    parts = _BLOCK_SEP_RE.split(raw_text)
-    skills: list[SkillManifestEntry] = []
-    for i in range(1, len(parts), 2):
-        fm_text = parts[i]
-        body_text = parts[i + 1].strip() if i + 1 < len(parts) else ""
-        data = yaml.safe_load(fm_text) or {}
-        if not data:
-            continue
-        skills.append(_build_entry(data, body_text))
-    return skills
+def upload(html: str, settings: AppSettings, request_id: str, client_id: str) -> str:
+    key = f"{settings.report_output_prefix}{client_id}/{request_id}.html"
 
+    if not settings.report_output_bucket:
+        logger.warning("report_output_bucket_unset", key=key)
+        return f"local://{key}"
 
-def _build_entry(data: dict, body_text: str) -> SkillManifestEntry:
-    missing = [k for k in REQUIRED_SKILL_KEYS if k not in data]
-    if missing:
-        raise ValueError(
-            f"skills.md entry missing required key(s) {missing}: "
-            f"{data.get('skill_id', '<unknown skill_id>')}"
-        )
-
-    required_agents = data["required_agents"]
-    if not required_agents:
-        raise ValueError(f"skill {data['skill_id']} has an empty required_agents list")
-    for agent in required_agents:
-        if "agent_role" not in agent or "question_template" not in agent:
-            raise ValueError(
-                f"skill {data['skill_id']} has a required_agents entry missing "
-                f"agent_role/question_template: {agent}"
-            )
-
-    return SkillManifestEntry(
-        skill_id=data["skill_id"],
-        rule_id=str(data["rule_id"]),
-        name=data["name"],
-        description=body_text,
-        enabled=data.get("enabled", True),
-        skill_type=data["skill_type"],
-        severity=data["severity"],
-        applicable_portfolios=data.get("applicable_portfolios") or [],
-        threshold=data.get("threshold") or {},
-        required_agents=required_agents,
+    client = boto3.client("s3", region_name=settings.aws_region)
+    client.put_object(
+        Bucket=settings.report_output_bucket,
+        Key=key,
+        Body=html.encode("utf-8"),
+        ContentType="text/html",
     )
-
-
-def filter_skills(
-    skills: list[SkillManifestEntry],
-    client_id: str,
-    rule_filter: list[str] | None,
-) -> list[SkillManifestEntry]:
-    """Filters to enabled + portfolio-applicable + (if given) rule_filter-matching
-    skills. Logs a warning (not silently dropping) for any requested rule that
-    doesn't match a known skill, since rule_filter came from an LLM guess, not
-    a maintained lookup."""
-    filtered: list[SkillManifestEntry] = []
-    for skill in skills:
-        if not skill.get("enabled", True):
-            continue
-        portfolios = skill.get("applicable_portfolios") or []
-        if portfolios and client_id not in portfolios:
-            continue
-        if rule_filter:
-            wanted = {r.strip().lower() for r in rule_filter}
-            if skill["rule_id"].lower() not in wanted and skill["skill_id"].lower() not in wanted:
-                continue
-        filtered.append(skill)
-
-    if rule_filter:
-        matched_ids = {s["rule_id"].lower() for s in filtered} | {s["skill_id"].lower() for s in filtered}
-        for requested in rule_filter:
-            if requested.strip().lower() not in matched_ids:
-                logger.warning("rule_filter_no_match", requested_rule=requested)
-
-    return filtered
+    return f"s3://{settings.report_output_bucket}/{key}"
