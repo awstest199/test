@@ -1,114 +1,117 @@
-"""Bedrock Converse wrapper -- used by the orchestrator (decompose_prompt,
-always runs) and the report node (summarize, optional, gated behind
-ENABLE_LLM_SUMMARY).
+"""Loads and parses the S3 skills.md manifest.
 
-decompose_prompt extracts exactly two fields from a long-form analyst
-prompt: client_id and rule_filter. The prompt's own methodology language
-("consider the lag of fraud tagging", "trend multiplier if fraud
-continues to deteriorate") is NOT re-derived here -- that describes the
-standing projection logic baked into evaluators/lag_trend_projection.py,
-not a per-request parameter.
+Format: Markdown with one YAML front-matter block per skill (delimited by
+`---` lines), Markdown body underneath each block for the human-readable
+description. No pydantic/schema library -- only the required-key checks in
+REQUIRED_SKILL_KEYS. `required_agents` length is not fixed; it's read
+straight from each skill's own manifest entry.
 """
 
-import json
 import re
+from pathlib import Path
 
 import boto3
+import yaml
 
-from src.config.settings import AppSettings
 from src.logging_setup import get_logger
-from src.models.results import PromptIntent
+from src.models.manifest import REQUIRED_SKILL_KEYS, SkillManifestEntry
 
 logger = get_logger()
 
-_DECOMPOSE_SYSTEM_PROMPT = (
-    "You are a request router for a fraud-detection rule agent. Given a natural-language "
-    "request from an analyst, extract exactly two fields as JSON: "
-    '{"client_id": "<the client/portfolio id the request refers to, or null if not mentioned>", '
-    '"rule_filter": ["<rule_id or skill_id>", ...] or null if the request does not name specific rules}. '
-    "Ignore any methodology or calculation instructions in the prompt (mentions of lag, trend "
-    "multipliers, projections, stress scenarios, etc.) -- those describe standing analysis logic "
-    "the system always applies, not per-request parameters to extract. "
-    "Respond with ONLY the JSON object, no other text."
-)
+_BLOCK_SEP_RE = re.compile(r"^---\s*$", re.MULTILINE)
+_DEFAULT_MANIFEST_PATH = Path(__file__).resolve().parent.parent / "fixtures" / "skills.md"
 
 
-def _client(settings: AppSettings):
-    return boto3.client("bedrock-runtime", region_name=settings.aws_region)
+def load_manifest(bucket: str, key: str, region: str) -> list[SkillManifestEntry]:
+    if not bucket:
+        # No SKILLS_MANIFEST_BUCKET configured -- fall back to the bundled
+        # default manifest so local dev (src/local_run.py) works with zero
+        # AWS setup. Production always sets the bucket explicitly.
+        logger.warning("skills_manifest_bucket_unset_using_local_fixture", path=str(_DEFAULT_MANIFEST_PATH))
+        raw_text = _DEFAULT_MANIFEST_PATH.read_text(encoding="utf-8")
+        return parse_manifest(raw_text)
+
+    client = boto3.client("s3", region_name=region)
+    response = client.get_object(Bucket=bucket, Key=key)
+    raw_text = response["Body"].read().decode("utf-8")
+    return parse_manifest(raw_text)
 
 
-def _extract_json(text: str) -> dict:
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            raise ValueError(f"could not extract JSON from LLM response: {text!r}")
-        return json.loads(match.group(0))
+def parse_manifest(raw_text: str) -> list[SkillManifestEntry]:
+    """Splits on `---` block separators. Layout is
+    [preamble, frontmatter_1, body_1, frontmatter_2, body_2, ...] --
+    front-matter blocks land at odd indices, bodies at the following even
+    index."""
+    parts = _BLOCK_SEP_RE.split(raw_text)
+    skills: list[SkillManifestEntry] = []
+    for i in range(1, len(parts), 2):
+        fm_text = parts[i]
+        body_text = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        data = yaml.safe_load(fm_text) or {}
+        if not data:
+            continue
+        skills.append(_build_entry(data, body_text))
+    return skills
 
 
-def decompose_prompt(prompt: str, settings: AppSettings) -> PromptIntent:
-    if settings.llm_mock:
-        return _mock_decompose(prompt)
+def _build_entry(data: dict, body_text: str) -> SkillManifestEntry:
+    missing = [k for k in REQUIRED_SKILL_KEYS if k not in data]
+    if missing:
+        raise ValueError(
+            f"skills.md entry missing required key(s) {missing}: "
+            f"{data.get('skill_id', '<unknown skill_id>')}"
+        )
 
-    client = _client(settings)
-    response = client.converse(
-        modelId=settings.bedrock_model_id,
-        system=[{"text": _DECOMPOSE_SYSTEM_PROMPT}],
-        messages=[{"role": "user", "content": [{"text": prompt}]}],
-        inferenceConfig={"temperature": 0.0, "maxTokens": 300},
+    required_agents = data["required_agents"]
+    if not required_agents:
+        raise ValueError(f"skill {data['skill_id']} has an empty required_agents list")
+    for agent in required_agents:
+        if "agent_role" not in agent or "question_template" not in agent:
+            raise ValueError(
+                f"skill {data['skill_id']} has a required_agents entry missing "
+                f"agent_role/question_template: {agent}"
+            )
+
+    return SkillManifestEntry(
+        skill_id=data["skill_id"],
+        rule_id=str(data["rule_id"]),
+        name=data["name"],
+        description=body_text,
+        enabled=data.get("enabled", True),
+        skill_type=data["skill_type"],
+        severity=data["severity"],
+        applicable_portfolios=data.get("applicable_portfolios") or [],
+        threshold=data.get("threshold") or {},
+        required_agents=required_agents,
     )
-    text = response["output"]["message"]["content"][0]["text"]
-    data = _extract_json(text)
-    return PromptIntent(client_id=data.get("client_id"), rule_filter=data.get("rule_filter"))
 
 
-def _mock_decompose(prompt: str) -> PromptIntent:
-    """Small heuristic mock for local dev (LLM_MOCK=true) only -- not a
-    substitute for the real model. Looks for an upper-case token that reads
-    like a client_id, and a few rule keywords."""
-    logger.info("llm_mock_decompose", prompt=prompt[:200])
+def filter_skills(
+    skills: list[SkillManifestEntry],
+    client_id: str,
+    rule_filter: list[str] | None,
+) -> list[SkillManifestEntry]:
+    """Filters to enabled + portfolio-applicable + (if given) rule_filter-matching
+    skills. Logs a warning (not silently dropping) for any requested rule that
+    doesn't match a known skill, since rule_filter came from an LLM guess, not
+    a maintained lookup."""
+    filtered: list[SkillManifestEntry] = []
+    for skill in skills:
+        if not skill.get("enabled", True):
+            continue
+        portfolios = skill.get("applicable_portfolios") or []
+        if portfolios and client_id not in portfolios:
+            continue
+        if rule_filter:
+            wanted = {r.strip().lower() for r in rule_filter}
+            if skill["rule_id"].lower() not in wanted and skill["skill_id"].lower() not in wanted:
+                continue
+        filtered.append(skill)
 
-    client_id = None
-    for token in prompt.replace(",", " ").replace(".", " ").split():
-        cleaned = token.strip(":;")
-        letters_only = cleaned.replace("_", "")
-        if len(cleaned) >= 3 and letters_only.isalpha() and letters_only.isupper():
-            client_id = cleaned
-            break
+    if rule_filter:
+        matched_ids = {s["rule_id"].lower() for s in filtered} | {s["skill_id"].lower() for s in filtered}
+        for requested in rule_filter:
+            if requested.strip().lower() not in matched_ids:
+                logger.warning("rule_filter_no_match", requested_rule=requested)
 
-    lowered = prompt.lower()
-    keyword_to_rule = {
-        "velocity": "3",
-        "volume-spike": "1",
-        "volume spike": "1",
-        "volume": "1",
-        "segment": "5",
-        "share": "5",
-    }
-    matched = {rid for kw, rid in keyword_to_rule.items() if kw in lowered}
-    rule_filter = sorted(matched) if matched else None
-
-    return PromptIntent(client_id=client_id, rule_filter=rule_filter)
-
-
-def summarize(results: list[dict], settings: AppSettings) -> str:
-    if not results:
-        return "No skills were evaluated for this run."
-
-    if settings.llm_mock:
-        flagged = [r for r in results if r["status"] == "FLAGGED"]
-        return f"{len(flagged)} of {len(results)} rules flagged in this run."
-
-    lines = [f"- {r['name']}: {r['status']} (metric={r.get('metric_value')})" for r in results]
-    user_text = (
-        "Summarize this fraud rule evaluation run in 2-3 sentences for a risk analyst:\n"
-        + "\n".join(lines)
-    )
-    client = _client(settings)
-    response = client.converse(
-        modelId=settings.bedrock_model_id,
-        messages=[{"role": "user", "content": [{"text": user_text}]}],
-        inferenceConfig={"temperature": 0.3, "maxTokens": 300},
-    )
-    return response["output"]["message"]["content"][0]["text"]
+    return filtered
