@@ -1,51 +1,31 @@
-"""structlog configuration -- JSON to stdout.
+# Copy to .env for local dev. Never commit the real .env (git-ignored) --
+# dev/prod values come from wherever the AgentCore Runtime deployment sets
+# environment variables, not from this file.
 
-No explicit watchtower/CloudWatch handler by default: both Lambda and
-Bedrock AgentCore Runtime ship container stdout/stderr to CloudWatch
-natively, so an extra PutLogEvents handler would double-ship logs and
-need its own IAM grant. watchtower is only wired in when
-ENABLE_WATCHTOWER=true, for the one legitimate edge case of running
-src/local_run.py from a bare dev machine with no other CloudWatch path.
-"""
+APP_ENV=local
+AWS_REGION=us-east-1
 
-import logging
-import sys
+# Knowledge Base -- single KB, every agent_worker calls the same one
+KNOWLEDGE_BASE_ID=
+KB_MOCK=true
 
-import structlog
+# LLM (prompt decomposition + optional executive summary)
+LLM_MOCK=true
+BEDROCK_MODEL_ID=anthropic.claude-3-5-haiku-20241022-v1:0
+ENABLE_LLM_SUMMARY=false
 
-from src.config.settings import AppSettings
+# Skills manifest (S3). Leave SKILLS_MANIFEST_BUCKET unset locally to use
+# the bundled app/fixtures/skills.md instead.
+SKILLS_MANIFEST_BUCKET=
+SKILLS_MANIFEST_KEY=skills/skills.md
 
-_configured = False
+# Report output (S3) -- a distinct bucket from the manifest input bucket.
+# Leave unset locally; report_service logs a local:// URI instead of
+# uploading.
+REPORT_OUTPUT_BUCKET=
+REPORT_OUTPUT_PREFIX=reports/
 
-
-def configure_logging(settings: AppSettings) -> None:
-    global _configured
-    if _configured:
-        return
-
-    structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.JSONRenderer(),
-        ],
-        wrapper_class=structlog.make_filtering_bound_logger(
-            getattr(logging, settings.log_level.upper(), logging.INFO)
-        ),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
-        cache_logger_on_first_use=True,
-    )
-
-    if settings.enable_watchtower:
-        import watchtower
-
-        logging.getLogger().addHandler(
-            watchtower.CloudWatchLogHandler(log_group=settings.cloudwatch_log_group)
-        )
-
-    _configured = True
-
-
-def get_logger(**initial_context):
-    return structlog.get_logger(**initial_context)
+# Logging
+LOG_LEVEL=DEBUG
+ENABLE_WATCHTOWER=false
+CLOUDWATCH_LOG_GROUP=/rule-agent/langgraph
