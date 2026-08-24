@@ -1,31 +1,40 @@
-"""Compiles the per-skill subgraph used as the top-level graph's
-skill_subgraph node (see src/graph/build_graph.py). Fan-out #2
-(dispatch_agents -> N x agent_worker) is sized by
-len(skill['required_agents']) at runtime -- nothing here assumes a fixed
-worker count. Wiring:
-
-    START -> dispatch_agents (conditional: Send x M) -> agent_worker (x M, parallel)
-          -> reduce_agent -> END
-"""
-
-from langgraph.graph import END, START, StateGraph
-
-from src.graph.skill_subgraph.nodes.agent_worker import agent_worker
-from src.graph.skill_subgraph.nodes.dispatch_agents import dispatch_agents
-from src.graph.skill_subgraph.nodes.reduce_agent import reduce_agent
-from src.graph.state import SkillState
 
 
-def build_skill_subgraph():
-    graph = StateGraph(SkillState)
-    graph.add_node("agent_worker", agent_worker)
-    graph.add_node("reduce_agent", reduce_agent)
-
-    graph.add_conditional_edges(START, dispatch_agents, ["agent_worker"])
-    graph.add_edge("agent_worker", "reduce_agent")
-    graph.add_edge("reduce_agent", END)
-
-    return graph.compile()
+from typing import Literal, TypedDict
 
 
-skill_subgraph_app = build_skill_subgraph()
+class RequiredAgent(TypedDict):
+    agent_role: str  # e.g. "baseline_data_agent", "aggregation_agent"
+    question_template: str
+
+
+class ThresholdSpec(TypedDict, total=False):
+    max_trended_rate_bps: float  # lag_trend_projection: flag if Trended TNF rate exceeds this
+    stress_uplift: float  # defaults to 1.2 if omitted, see evaluators/lag_trend_projection.py
+    max_apps_per_entity: int
+    window_hours: int
+    psi_warning: float
+    psi_critical: float
+
+
+class SkillManifestEntry(TypedDict):
+    skill_id: str
+    rule_id: str
+    name: str
+    description: str  # markdown body under this skill's front matter
+    enabled: bool
+    skill_type: Literal["UCL", "VENDOR_CODE_MATCH", "PSI"]  # key into evaluators/base.py's EVALUATORS dict
+    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    applicable_portfolios: list[str]  # [] = all portfolios
+    threshold: ThresholdSpec
+    required_agents: list[RequiredAgent]  # dynamic length -- 2, 3, 4, 5, ...
+
+
+REQUIRED_SKILL_KEYS = (
+    "skill_id",
+    "rule_id",
+    "name",
+    "skill_type",
+    "severity",
+    "required_agents",
+)
