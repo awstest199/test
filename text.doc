@@ -1,58 +1,29 @@
-"""Generic worker: one dynamic instance per required_agents entry. Formats
-its assigned question_template, calls the single Knowledge Base, and
-returns its parsed answer keyed by agent_role. A KB call/parse failure for
-one worker becomes an error marker for that role, not an exception that
-kills the whole skill.
+"""Fan-out #2 (conditional-edge routing function, wired at the subgraph's
+START): one Send("agent_worker", ...) per entry in THIS skill's
+required_agents list. M is whatever len(required_agents) is for this
+skill -- nothing here assumes a fixed count.
 """
 
-from src.config.settings import get_settings
-from src.graph.state import AgentWorkerInput
-from src.logging_setup import get_logger
-from src.services import kb_query_service
+from langgraph.types import Send
 
-logger = get_logger()
+from src.graph.state import SkillState
 
 
-def _substitute_placeholders(template: str, **values) -> str:
-    """Replaces only exact `{key}` tokens via literal string substitution --
-    deliberately NOT str.format()/format_map(). Question templates embed
-    literal JSON examples (e.g. `{"mature_rate_bps": ...}`) to show the KB
-    what shape to answer in, and Python's format mini-language chokes on
-    the `:` inside those braces (raises "Format specifier missing
-    precision"). Plain substring replacement sidesteps that entirely and
-    leaves every other `{...}` in the text untouched. A value of None
-    leaves its placeholder as-is (rule types that don't need it, e.g.
-    {window_hours} on a non-velocity question, simply won't contain the
-    token to begin with)."""
-    result = template
-    for key, value in values.items():
-        if value is None:
-            continue
-        result = result.replace("{" + key + "}", str(value))
-    return result
+def dispatch_agents(state: SkillState):
+    skill = state["skill"]
+    threshold = skill.get("threshold") or {}
 
-
-async def agent_worker(state: AgentWorkerInput) -> dict:
-    agent_role = state["agent_role"]
-    log = logger.bind(
-        request_id=state["request_id"],
-        rule_id=state["rule_id"],
-        agent_role=agent_role,
-    )
-
-    question = _substitute_placeholders(
-        state["question_template"],
-        client_id=state["client_id"],
-        rule_id=state["rule_id"],
-        window_hours=state.get("window_hours"),
-    )
-
-    settings = get_settings()
-    try:
-        answer = kb_query_service.query(question, settings)
-        log.info("agent_worker_ok", question=question[:200])
-    except Exception as exc:  # noqa: BLE001 -- one bad worker must not crash the skill
-        log.warning("agent_worker_failed", question=question[:200], error=str(exc))
-        answer = {"_error": str(exc)}
-
-    return {"worker_outputs": {agent_role: answer}}
+    return [
+        Send(
+            "agent_worker",
+            {
+                "request_id": state["request_id"],
+                "client_id": state["client_id"],
+                "rule_id": skill["rule_id"],
+                "agent_role": agent["agent_role"],
+                "question_template": agent["question_template"],
+                "window_hours": threshold.get("window_hours"),
+            },
+        )
+        for agent in skill["required_agents"]
+    ]
