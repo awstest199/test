@@ -1,68 +1,58 @@
-"""Orchestrator: LLM-decomposes the incoming prompt into client_id +
-rule_filter (entity resolution from prose, not calculation-parameter
-parsing -- see services/llm_service.decompose_prompt for why), then
-deterministically loads and filters the skills manifest. Fan-out #1
-(route_to_skills) sends one branch per remaining skill -- nothing here
-assumes a fixed skill count.
+"""Report node: builds the MVP1 simple summary (client_id, run metadata,
+one row per skill), optionally adds a short LLM executive summary, renders
+and uploads to the report output S3 bucket -- a distinct bucket from the
+skills-manifest input bucket. Not the full multi-section analyst dashboard
+(monthly trend charts, predictor tables, heatmap, 3-scenario projection,
+prioritized recommendations) seen in the real reference reports -- that's
+an explicitly deferred follow-up; SkillResult.worker_outputs_used already
+carries the richer numbers needed for it later.
 """
 
 from datetime import datetime, timezone
 
-from langgraph.types import Send
-
 from src.config.settings import get_settings
 from src.graph.state import GraphState
 from src.logging_setup import get_logger
-from src.services import llm_service, manifest_service
+from src.services import llm_service, report_service
 
 logger = get_logger()
 
 
-async def orchestrator(state: GraphState) -> dict:
+async def report_node(state: GraphState) -> dict:
     log = logger.bind(request_id=state["request_id"])
+
+    if state.get("status") == "FAILED":
+        log.error("report_skipped_failed_run", errors=state.get("errors"))
+        return {"status": "FAILED"}
+
     settings = get_settings()
+    results = state.get("results", [])
+    flagged_count = sum(1 for r in results if r["status"] == "FLAGGED")
+    log.info("report_start", total_results=len(results), flagged_count=flagged_count)
 
-    log.info("decompose_prompt_start", prompt=state["prompt"][:300])
-    intent = llm_service.decompose_prompt(state["prompt"], settings)
-    client_id = intent.get("client_id")
-    rule_filter = intent.get("rule_filter")
-    log.info("decompose_prompt_done", client_id=client_id, rule_filter=rule_filter)
+    summary_text = None
+    if settings.enable_llm_summary:
+        summary_text = llm_service.summarize(results, settings)
 
-    if not client_id:
-        log.error("decompose_prompt_missing_client_id", prompt=state["prompt"][:300])
-        return {
-            "client_id": None,
-            "rule_filter": rule_filter,
-            "skills": [],
-            "status": "FAILED",
-            "errors": ["Could not resolve a client_id from the prompt"],
-        }
-
-    manifest_bucket = state.get("manifest_bucket") or settings.skills_manifest_bucket
-    manifest_key = state.get("manifest_key") or settings.skills_manifest_key
-
-    all_skills = manifest_service.load_manifest(manifest_bucket, manifest_key, settings.aws_region)
-    skills = manifest_service.filter_skills(all_skills, client_id, rule_filter)
-    log.info("manifest_filtered", total_skills=len(all_skills), applicable_skills=len(skills))
-
-    return {
-        "client_id": client_id,
-        "rule_filter": rule_filter,
-        "manifest_bucket": manifest_bucket,
-        "manifest_key": manifest_key,
-        "skills": skills,
-        "status": "RUNNING",
-        "invoked_at": datetime.now(timezone.utc).isoformat(),
+    context = {
+        "request_id": state["request_id"],
+        "client_id": state.get("client_id") or "",
+        "invoked_at": state.get("invoked_at") or datetime.now(timezone.utc).isoformat(),
+        "prompt": state.get("prompt", ""),
+        "results": results,
+        "flagged_count": flagged_count,
+        "total_count": len(results),
+        "summary_text": summary_text,
     }
 
+    html = report_service.render(context)
+    report_s3_uri = report_service.upload(
+        html, settings, state["request_id"], state.get("client_id") or "unknown"
+    )
+    log.info("report_uploaded", report_s3_uri=report_s3_uri)
 
-def route_to_skills(state: GraphState):
-    if state.get("status") == "FAILED" or not state.get("skills"):
-        return "report"
-    return [
-        Send(
-            "skill_subgraph",
-            {"request_id": state["request_id"], "client_id": state["client_id"], "skill": skill},
-        )
-        for skill in state["skills"]
-    ]
+    return {
+        "report_html": html,
+        "report_s3_uri": report_s3_uri,
+        "status": "COMPLETED",
+    }
