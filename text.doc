@@ -7,7 +7,7 @@ client = boto3.client(
 )
 
 response = client.invoke_agent_runtime(
-    agentRuntimeArn="arn:aws:bedrock-agentcore:us-east-1:593793040112:runtime/<runtime-id>",
+    agentRuntimeArn="",
     qualifier="DEFAULT",
     payload=json.dumps({
         "prompt": "test request"
