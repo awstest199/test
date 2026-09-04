@@ -1,18 +1,1 @@
-import boto3
-import json
-
-client = boto3.client(
-    "bedrock-agentcore",
-    region_name="us-east-1"
-)
-
-response = client.invoke_agent_runtime(
-    agentRuntimeArn="",
-    qualifier="DEFAULT",
-    payload=json.dumps({
-        "prompt": "test request"
-    }).encode("utf-8")
-)
-
-for chunk in response["response"]:
-    print(chunk)
+test
