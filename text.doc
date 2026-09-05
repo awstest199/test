@@ -1,1 +1,37 @@
-test
+############################################
+## sample AgentCore Cross-Account Resource Policy
+############################################
+
+data "aws_iam_policy_document" "agentcore_cross_account" {
+
+  statement {
+    sid    = "AllowCrossAccountLambdaInvoke"
+    effect = "Allow"
+
+    actions = [
+      "bedrock-agentcore:InvokeAgentRuntime"
+    ]
+
+    principals {
+      type = "AWS"
+
+      identifiers = [
+        "xx"
+      ]
+    }
+
+    resources = [
+      module.xxx.agent_runtime_arn
+    ]
+  }
+}
+
+module "test_agentcore_resource_policy" {
+
+  source = """
+  policy = data.aws_iam_policy_document.agentcore_cross_account.json
+
+  resource_arn = module.xx.agent_runtime_arn
+
+  region = var.region
+}
